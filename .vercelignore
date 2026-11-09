@@ -1,0 +1,10 @@
+# Không upload lên Vercel
+.env
+.env.local
+.env*.local
+*.local.sql
+scraper/.auth.json
+scraper/debug/
+node_modules
+.next
+*.tsbuildinfo

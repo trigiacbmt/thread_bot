@@ -1,0 +1,13 @@
+node_modules
+.next
+out
+.env
+.env.local
+.env*.local
+*.tsbuildinfo
+next-env.d.ts
+.vercel
+# Cookie acc phụ của scraper — KHÔNG commit
+scraper/.auth.json
+scraper/debug/
+*.local.sql
