@@ -11,6 +11,7 @@ import { queue, type QueueItem } from "./queue";
 import { tokenStore } from "./store";
 import { log } from "./activity";
 import { isVietnamese } from "./lang";
+import { inWindow, viralWindow } from "./viralWindow";
 
 export interface ViralPost {
   id: string;
@@ -38,10 +39,6 @@ export interface ViralPost {
 }
 
 // ---------- Quét ----------
-/** Đủ "viral" khi đạt CẢ 3 ngưỡng: lượt thích, bình luận, chia sẻ (repost). */
-export function isViralEnough(e: { likes: number; replies: number; reposts: number }, s: Settings) {
-  return e.likes >= s.viralMinLikes && e.replies >= s.viralMinReplies && e.reposts >= s.viralMinReposts;
-}
 
 export interface ScanResult {
   source: ViralSource;
@@ -54,8 +51,12 @@ export interface ScanResult {
   scanned: number;
   /** Bài không phải tiếng Việt (bị bỏ qua khi bật "Chỉ bài tiếng Việt") */
   foreign?: number;
-  /** Bài ít tương tác (dưới "Lượt thích tối thiểu") bị bỏ qua */
-  weak?: number;
+  /** Bài nằm ngoài khoảng ngày đã chọn */
+  outOfRange?: number;
+  /** Bài đã có trong kho (trùng mã bài hoặc trùng nội dung) — không thêm lại */
+  duplicates?: number;
+  /** Khoảng thời gian đã lọc, VD "01/11/2026 – 15/11/2026" */
+  window?: string;
   newPosts: number;
   classified: number;
   errors: number;
@@ -74,30 +75,23 @@ interface Hit {
   engagement?: { likes: number; replies: number; reposts: number };
 }
 
-let warnedNoEngagementCols = false;
+/** Ghi 1 bài. Trùng id / mã bài / nội dung với bài đã có → chỉ cập nhật bài cũ (giữ trạng thái), trả về is_new = false. */
 async function recordHit(h: Hit): Promise<boolean> {
-  const isNew = must(
-    await db().rpc("upsert_viral_hit", {
+  const r = must(
+    await db().rpc("upsert_viral_post", {
       p_id: h.id, p_keyword: h.keyword, p_text: h.text, p_username: h.username,
       p_permalink: h.permalink, p_media_type: h.mediaType,
       p_has_replies: h.hasReplies, p_posted_at: h.postedAt, p_rank: h.rank,
+      p_likes: h.engagement?.likes ?? null, p_replies: h.engagement?.replies ?? null, p_reposts: h.engagement?.reposts ?? null,
     }),
-  ) as boolean;
-  if (h.engagement) {
-    const { error } = await db().from("viral_posts").update({
-      like_count: h.engagement.likes, reply_count: h.engagement.replies, repost_count: h.engagement.reposts,
-    }).eq("id", h.id);
-    if (error && !warnedNoEngagementCols) {
-      warnedNoEngagementCols = true;
-      await log("error", "Chưa lưu được lượt like/reply — hãy chạy supabase/migrations/0002_viral_engagement.sql", { error: error.message });
-    }
-  }
-  return isNew;
+  ) as { id: string; is_new: boolean };
+  return r.is_new;
 }
 
 /** Quét bài viral theo nguồn trong Cài đặt, ghi nhận thứ hạng, rồi cho AI phân loại bài mới. */
 export async function scanViral(s?: Settings): Promise<ScanResult> {
   s ??= await getSettings();
+  const win = viralWindow(s);
   const base: ScanResult = {
     source: s.viralSource, keywords: s.viralKeywords.length, total: 0, own: 0, scanned: 0, newPosts: 0,
     classified: 0, errors: 0, limited: false, at: new Date().toISOString(),
@@ -148,10 +142,10 @@ export async function scanViral(s?: Settings): Promise<ScanResult> {
     }
   } else {
     if (!token) return finish({ ...base, skipped: "Chưa kết nối tài khoản Threads" });
-    const since = Math.floor(Date.now() / 1000) - s.viralMaxAgeHours * 3600;
+    const since = win.since;
     for (const kw of s.viralKeywords) {
       try {
-        const { data } = await keywordSearch(kw, { searchType: "TOP", since, limit: s.viralSearchLimit });
+        const { data } = await keywordSearch(kw, { searchType: "TOP", since, until: win.until ?? undefined, limit: s.viralSearchLimit });
         total += data.length;
         for (const [rank, p] of data.entries()) {
           if (p.username === me) { own++; continue; } // bỏ bài của chính mình
@@ -168,12 +162,18 @@ export async function scanViral(s?: Settings): Promise<ScanResult> {
     }
   }
 
-  let scanned = 0, newPosts = 0, foreign = 0, weak = 0;
+  let scanned = 0, newPosts = 0, foreign = 0, outOfRange = 0, duplicates = 0;
+  const seenText = new Set<string>();
   for (const h of hits) {
+    if (!inWindow(win, h.postedAt)) { outOfRange++; continue; }
     if (s.viralVietnameseOnly && !isVietnamese(h.text)) { foreign++; continue; }
-    if (h.engagement && !isViralEnough(h.engagement, s)) { weak++; continue; }
+    // Trùng ngay trong lượt quét này (cùng bài xuất hiện ở nhiều từ khoá)
+    const key = h.text.toLowerCase().replace(/[\s\p{P}]+/gu, "").slice(0, 400);
+    if (seenText.has(key)) { duplicates++; continue; }
+    seenText.add(key);
     try {
       if (await recordHit(h)) newPosts++;
+      else duplicates++;
       scanned++;
     } catch (e) {
       errors++;
@@ -185,14 +185,14 @@ export async function scanViral(s?: Settings): Promise<ScanResult> {
   must(await db().rpc("rescore_viral_posts"));
   // Chưa có quyền tìm kiếm công khai: Threads chỉ trả bài của chính tài khoản (hoặc không trả gì)
   const limited = s.viralSource === "meta" && errors < s.viralKeywords.length && scanned === 0 && (total === 0 || own === total);
-  const result: ScanResult = { ...base, total, own, scanned, foreign, weak, newPosts, classified, errors, limited, usage, at: new Date().toISOString() };
+  const result: ScanResult = { ...base, total, own, scanned, foreign, outOfRange, duplicates, window: win.label, newPosts, classified, errors, limited, usage, at: new Date().toISOString() };
   await finish(result);
   const src = s.viralSource === "apify" ? "Apify" : "Threads";
   await log(
     limited ? "error" : "watch",
     limited
       ? `Quét viral: ${total} kết quả, ${own} là bài của bạn, 0 bài công khai — có thể app chưa được duyệt quyền threads_keyword_search`
-      : `Quét viral (${src}): ${scanned} bài${foreign || weak ? ` (bỏ ${[foreign && `${foreign} bài không phải tiếng Việt`, weak && `${weak} bài ít tương tác`].filter(Boolean).join(", ")})` : ""}, ${newPosts} bài mới, AI phân loại ${classified}${usage ? ` · tháng này ≈ $${usage.estUsd}` : ""}`,
+      : `Quét viral (${src}, ${win.label}): ${newPosts} bài mới, ${duplicates} bài trùng đã có${[outOfRange && `${outOfRange} ngoài khoảng ngày`, foreign && `${foreign} không phải tiếng Việt`].filter(Boolean).length ? ` (bỏ ${[outOfRange && `${outOfRange} ngoài khoảng ngày`, foreign && `${foreign} không phải tiếng Việt`].filter(Boolean).join(", ")})` : ""}, AI phân loại ${classified}${usage ? ` · tháng này ≈ $${usage.estUsd}` : ""}`,
     result,
   );
   return result;
@@ -251,7 +251,7 @@ async function fetchOembedText(url: string): Promise<string | null> {
 }
 
 /** Thêm một bài viral do người dùng tự tìm (dán link và/hoặc nội dung) → AI phân loại + chấm điểm ngay. */
-export async function addManualViral(input: { url?: string; text?: string; username?: string }): Promise<ViralPost> {
+export async function addManualViral(input: { url?: string; text?: string; username?: string }): Promise<ViralPost & { duplicate?: boolean }> {
   const url = input.url?.trim() || null;
   const parsed = url ? parseThreadsUrl(url) : {};
   if (url && !parsed.shortcode) throw new Error("Link không đúng dạng bài Threads (https://www.threads.com/@ten/post/…)");
@@ -260,16 +260,23 @@ export async function addManualViral(input: { url?: string; text?: string; usern
   if (!text) throw new Error("Không tự lấy được nội dung từ link — hãy dán nội dung bài vào ô bên dưới");
   if (text.length < 15) throw new Error("Nội dung quá ngắn");
 
-  const id = "manual-" + (parsed.shortcode ?? crypto.createHash("sha1").update(text).digest("hex").slice(0, 16));
-  must(
-    await db().rpc("upsert_viral_hit", {
-      p_id: id, p_keyword: "Thủ công", p_text: text.slice(0, 3000),
+  const r = must(
+    await db().rpc("upsert_viral_post", {
+      p_id: "manual-" + (parsed.shortcode ?? crypto.createHash("sha1").update(text).digest("hex").slice(0, 16)),
+      p_keyword: "Thủ công", p_text: text.slice(0, 3000),
       p_username: input.username?.trim().replace(/^@/, "") || parsed.username || null,
       p_permalink: url, p_media_type: null, p_has_replies: true, p_posted_at: new Date().toISOString(), p_rank: 0,
     }),
-  );
+  ) as { id: string; is_new: boolean };
+  const id = r.id;
+  if (!r.is_new) {
+    // Bài đã có trong kho (cùng link hoặc cùng nội dung) → không thêm lại, trả về bài cũ
+    const existing = await getViral(id);
+    if (!existing) throw new Error("Không lưu được bài");
+    return { ...existing, duplicate: true };
+  }
   // Người dùng tự chọn bài → coi như đã nổi: nâng số lần xuất hiện để điểm không bị thấp
-  must(await db().from("viral_posts").update({ seen_count: 5, status: "new", ai_checked: false }).eq("id", id));
+  must(await db().from("viral_posts").update({ seen_count: 5 }).eq("id", id));
   await classifyPending(15);
   must(await db().rpc("rescore_viral_posts"));
   const post = await getViral(id);
@@ -285,19 +292,6 @@ export async function classifyPending(max = 60): Promise<number> {
   ) as Array<{ id: string; text: string | null; keyword: string }>;
   // Bài không phải tiếng Việt (scraper ghi vào, hoặc quét trước khi bật bộ lọc) → bỏ qua luôn, khỏi tốn AI
   const st = await getSettings();
-  // Bài Apify/scraper cũ chưa đạt ngưỡng like/bình luận/chia sẻ → bỏ qua
-  if (st.viralMinLikes > 0 || st.viralMinReplies > 0 || st.viralMinReposts > 0) {
-    const { data: rows, error } = await db().from("viral_posts").select("id,like_count,reply_count,repost_count")
-      .eq("status", "new").or("id.like.ap-%,id.like.sc-%").limit(500);
-    const weak = error ? [] : ((rows ?? []) as Array<{ id: string; like_count: number; reply_count: number; repost_count: number }>)
-      .filter((r) => !isViralEnough({ likes: r.like_count, replies: r.reply_count, reposts: r.repost_count }, st)).map((r) => r.id);
-    if (weak.length) {
-      must(await db().from("viral_posts").update({
-        status: "dismissed", ai_reason: `Chưa đủ viral (cần ≥${st.viralMinLikes} like, ≥${st.viralMinReplies} bình luận, ≥${st.viralMinReposts} chia sẻ)`,
-      }).in("id", weak));
-      pending = pending.filter((p) => !weak.includes(p.id));
-    }
-  }
   if (st.viralVietnameseOnly) {
     const fresh = must(
       await db().from("viral_posts").select("id,text,keyword").eq("status", "new").neq("keyword", "Thủ công").limit(500),

@@ -3,6 +3,7 @@
 import { kvGet, kvSet } from "./db";
 import { isValidCron } from "./cronMatch";
 
+import type { ViralDateMode } from "./viralWindow";
 export type ViralSource = "apify" | "scraper" | "meta" | "manual";
 export type LinkMode = "reply" | "inline" | "none";
 export type ReplyControl = "everyone" | "accounts_you_follow" | "mentioned_only" | "parent_post_author_only" | "followers_only";
@@ -45,7 +46,13 @@ export interface Settings {
   viralSource: ViralSource;
   viralKeywords: string[];
   viralCron: string;
+  /** "recent" = N giờ gần đây (viralMaxAgeHours), "range" = từ ngày … đến ngày … */
+  viralDateMode: ViralDateMode;
   viralMaxAgeHours: number;
+  /** YYYY-MM-DD theo múi giờ cài đặt (chế độ "range") */
+  viralDateFrom: string;
+  /** YYYY-MM-DD, tính trọn ngày; trống = tới hiện tại */
+  viralDateTo: string;
   /** Số kết quả TOP lấy cho mỗi từ khoá mỗi lần quét (tối đa 100) */
   viralSearchLimit: number;
   autoViralDrafts: boolean;
@@ -61,20 +68,12 @@ export interface Settings {
   viralVietnameseOnly: boolean;
   /** Bao lâu scraper quét 1 lượt (phút, 30–1440) */
   scraperIntervalMinutes: number;
-  /** Chỉ giữ bài có ít nhất ngần này lượt thích */
-  scraperMinLikes: number;
   /** Số lần cuộn trang profile để tải thêm bài (0–5) */
   scraperScrolls: number;
   /** Actor trên Apify Store, dạng user/ten-actor */
   apifyActor: string;
   /** Số bài lấy mỗi từ khoá mỗi lần quét qua Apify (bị tính phí theo bài) */
   apifyMaxPosts: number;
-  /** Bỏ bài có ít lượt thích hơn mức này (chỉ áp dụng khi nguồn trả về lượt thích, VD Apify) */
-  viralMinLikes: number;
-  /** Số bình luận tối thiểu */
-  viralMinReplies: number;
-  /** Số lượt chia sẻ (repost + quote) tối thiểu */
-  viralMinReposts: number;
   /** Giá actor (USD / 1.000 bài) — chỉ để ước tính chi phí */
   apifyPricePer1k: number;
   /** Ngân sách tháng (USD). Ước tính vượt mức này thì ngừng quét. 0 = không giới hạn */
@@ -119,7 +118,10 @@ export const DEFAULT_SETTINGS: Settings = {
   viralSource: "manual",
   viralKeywords: ["mẹo hay", "mẹo vặt", "tips cuộc sống", "mẹo nhà bếp", "mẹo dọn nhà", "mẹo tiết kiệm", "life hack"],
   viralCron: "15 */2 * * *",
+  viralDateMode: "recent",
   viralMaxAgeHours: 72,
+  viralDateFrom: "",
+  viralDateTo: "",
   viralSearchLimit: 50,
   autoViralDrafts: true,
   viralDailyDrafts: 3,
@@ -129,13 +131,9 @@ export const DEFAULT_SETTINGS: Settings = {
   scraperSearchKeywords: true,
   viralVietnameseOnly: true,
   scraperIntervalMinutes: 120,
-  scraperMinLikes: 50,
   scraperScrolls: 2,
   apifyActor: "webdata_labs/threads-scraper",
   apifyMaxPosts: 3,
-  viralMinLikes: 200,
-  viralMinReplies: 20,
-  viralMinReposts: 5,
   apifyPricePer1k: 3,
   apifyMonthlyBudget: 5,
   apifyInputTemplate: "",
@@ -203,8 +201,11 @@ function validate(p: Partial<Settings>): Partial<Settings> {
   }
   const clamp = (v: number | undefined, min: number, max: number) => (v === undefined ? undefined : Math.min(max, Math.max(min, Math.round(Number(v) || 0))));
   if (out.viralSearchLimit !== undefined) out.viralSearchLimit = clamp(out.viralSearchLimit, 5, 100);
-  for (const k of ["viralMinLikes", "viralMinReplies", "viralMinReposts"] as const) {
-    if (out[k] !== undefined) out[k] = clamp(out[k], 0, 1_000_000);
+  if (out.viralDateMode !== undefined && !["recent", "range"].includes(out.viralDateMode)) throw new Error("Chế độ thời gian không hợp lệ");
+  for (const k of ["viralDateFrom", "viralDateTo"] as const) {
+    if (out[k] === undefined) continue;
+    out[k] = String(out[k] ?? "").trim();
+    if (out[k] && !/^\d{4}-\d{2}-\d{2}$/.test(out[k]!)) throw new Error("Ngày phải có dạng YYYY-MM-DD");
   }
   if (out.apifyMaxPosts !== undefined) out.apifyMaxPosts = clamp(out.apifyMaxPosts, 1, 50);
   for (const k of ["apifyPricePer1k", "apifyMonthlyBudget"] as const) {
@@ -215,7 +216,6 @@ function validate(p: Partial<Settings>): Partial<Settings> {
   if (out.maxRepliesPerHour !== undefined) out.maxRepliesPerHour = clamp(out.maxRepliesPerHour, 0, 200);
   if (out.minViralScore !== undefined) out.minViralScore = clamp(out.minViralScore, 0, 1000);
   if (out.scraperIntervalMinutes !== undefined) out.scraperIntervalMinutes = clamp(out.scraperIntervalMinutes, 30, 1440);
-  if (out.scraperMinLikes !== undefined) out.scraperMinLikes = clamp(out.scraperMinLikes, 0, 1_000_000);
   if (out.scraperScrolls !== undefined) out.scraperScrolls = clamp(out.scraperScrolls, 0, 5);
   if (out.viralSourceAccounts !== undefined) {
     // Nhận "@ten", "ten" hoặc link https://www.threads.com/@ten
@@ -237,6 +237,10 @@ function validate(p: Partial<Settings>): Partial<Settings> {
 
 export async function updateSettings(patch: Partial<Settings>): Promise<Settings> {
   const next = { ...(await getSettings()), ...validate(patch) };
+  if (next.viralDateMode === "range") {
+    if (!next.viralDateFrom) throw new Error("Chọn ngày bắt đầu cho khoảng thời gian săn bài");
+    if (next.viralDateTo && next.viralDateTo < next.viralDateFrom) throw new Error("Ngày kết thúc phải sau ngày bắt đầu");
+  }
   await kvSet("settings", next);
   return next;
 }

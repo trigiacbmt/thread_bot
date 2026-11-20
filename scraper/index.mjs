@@ -71,14 +71,39 @@ const DEFAULTS = {
   viralKeywords: [],
   scraperSearchKeywords: true,
   scraperIntervalMinutes: 120,
-  scraperMinLikes: 50,
-  viralMinLikes: 200,
-  viralMinReplies: 20,
-  viralMinReposts: 5,
   viralVietnameseOnly: true,
   scraperScrolls: 2,
   viralMaxAgeHours: 72,
+  viralDateMode: "recent",
+  viralDateFrom: "",
+  viralDateTo: "",
+  timezone: "Asia/Ho_Chi_Minh",
 };
+
+// ---------- Khoảng thời gian (giống src/lib/viralWindow.ts — sửa thì sửa cả hai) ----------
+function startOfDayInTz(date, tz) {
+  const utc = Date.parse(`${date}T00:00:00Z`);
+  const asTz = Date.parse(new Date(utc).toLocaleString("en-US", { timeZone: tz }));
+  const asUtc = Date.parse(new Date(utc).toLocaleString("en-US", { timeZone: "UTC" }));
+  return Math.floor((utc - (asTz - asUtc)) / 1000);
+}
+const addDays = (date, n) => new Date(Date.parse(`${date}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
+const viDate = (d) => d.split("-").reverse().join("/");
+function viralWindow(s) {
+  if (s.viralDateMode === "range" && s.viralDateFrom) {
+    const to = s.viralDateTo || null;
+    const beforeDate = to ? addDays(to, 1) : null;
+    return {
+      since: startOfDayInTz(s.viralDateFrom, s.timezone),
+      until: beforeDate ? startOfDayInTz(beforeDate, s.timezone) - 1 : null,
+      fromDate: s.viralDateFrom, beforeDate,
+      label: to ? `${viDate(s.viralDateFrom)} – ${viDate(to)}` : `từ ${viDate(s.viralDateFrom)}`,
+    };
+  }
+  return { since: Math.floor(Date.now() / 1000) - s.viralMaxAgeHours * 3600, until: null, fromDate: null, beforeDate: null, label: `${s.viralMaxAgeHours} giờ gần đây` };
+}
+/** Từ khoá kèm bộ lọc ngày của Threads (after:/before:) khi đang ở chế độ khoảng ngày. */
+const rangedQuery = (kw, win) => [kw, win.fromDate && `after:${win.fromDate}`, win.beforeDate && `before:${win.beforeDate}`].filter(Boolean).join(" ");
 async function getSettings() {
   const row = must(await db().from("kv").select("value").eq("key", "settings").maybeSingle());
   return { ...DEFAULTS, ...(row?.value ?? {}) };
@@ -89,22 +114,16 @@ async function activity(type, message, data) {
   if (error) console.error("Không ghi được activity:", error.message);
 }
 
-/** Ghi 1 bài giống recordHit() trong src/lib/viral.ts: upsert_viral_hit + lượt tương tác (cột từ 0002_viral_engagement.sql). */
-let warnedNoEngagementCols = false;
+/** Ghi 1 bài (giống recordHit() trong src/lib/viral.ts). Trùng id / mã bài / nội dung với bài đã có → chỉ cập nhật bài cũ.
+    Cần supabase/migrations/0003_viral_dedupe.sql. Trả về true nếu là bài mới. */
 async function recordHit(p, keyword, rank) {
-  const id = `sc-${p.code}`;
-  const isNew = must(await db().rpc("upsert_viral_hit", {
-    p_id: id, p_keyword: keyword, p_text: p.text.slice(0, 3000), p_username: p.username,
+  const r = must(await db().rpc("upsert_viral_post", {
+    p_id: `sc-${p.code}`, p_keyword: keyword, p_text: p.text.slice(0, 3000), p_username: p.username,
     p_permalink: p.permalink, p_media_type: p.mediaType, p_has_replies: p.replies > 0,
     p_posted_at: new Date(p.takenAt * 1000).toISOString(), p_rank: rank,
+    p_likes: p.likes, p_replies: p.replies, p_reposts: p.reposts + (p.quotes ?? 0),
   }));
-  const { error } = await db().from("viral_posts")
-    .update({ like_count: p.likes, reply_count: p.replies, repost_count: p.reposts }).eq("id", id);
-  if (error && !warnedNoEngagementCols) {
-    warnedNoEngagementCols = true;
-    say("Chưa lưu được lượt like/reply — hãy chạy supabase/migrations/0002_viral_engagement.sql:", error.message);
-  }
-  return isNew;
+  return r.is_new;
 }
 
 // ---------- Trình duyệt ----------
@@ -187,7 +206,7 @@ async function scrapePage(context, url, scrolls) {
       let text = "";
       try { text = await res.text(); } catch { /* body không đọc được (redirect…) */ }
       const hasPosts = text.includes("taken_at");
-      if (DEBUG) net.push(`${res.status()} ${type.padEnd(8)} ${String(text.length).padStart(8)}B ${hasPosts ? "★taken_at" : "         "} ${res.url().slice(0, 160)}`);
+      net.push(`${res.status()} ${type.padEnd(8)} ${String(text.length).padStart(8)}B ${hasPosts ? "★taken_at" : "         "} ${res.url().slice(0, 160)}`);
       if (hasPosts) {
         const j = safeParse(text);
         if (j) collectPosts(j, found);
@@ -211,11 +230,28 @@ async function scrapePage(context, url, scrolls) {
     // Trang tìm kiếm tải kết quả bằng JS sau khi mở → đợi tới khi có bài (tối đa ~12 giây)
     const deadline = Date.now() + 12_000;
     await page.waitForTimeout(jitter(2000, 3000));
-    while (Date.now() < deadline) {
-      await readEmbedded();
-      if (found.size) break;
-      await page.waitForTimeout(1500);
+    const waitForPosts = async (ms) => {
+      const until = Date.now() + ms;
+      while (Date.now() < until) {
+        await readEmbedded();
+        if (found.size) return;
+        await page.waitForTimeout(1500);
+      }
+    };
+    await waitForPosts(deadline - Date.now());
+    // Tab "Liên quan nhất" báo "Không có kết quả" (hay gặp với từ khoá sức khoẻ/làm đẹp) → thử tab "Mới đây"
+    const noResults = async () => /Không có kết quả|No results/i.test(await page.locator("body").innerText().catch(() => ""));
+    let tab = "Liên quan nhất";
+    if (!found.size && /\/search\?/.test(url) && (await noResults())) {
+      const recent = page.getByText(/^(Mới đây|Recent)$/).first();
+      if (await recent.isVisible().catch(() => false)) {
+        await recent.click().catch(() => {});
+        tab = "Mới đây";
+        await page.waitForTimeout(jitter(1500, 2500));
+        await waitForPosts(10_000);
+      }
     }
+    const emptyPage = !found.size && (await noResults());
     // Cuộn để tải thêm (infinite scroll). Đặt chuột giữa cột nội dung — nếu chuột nằm ở góc trái
     // (thanh menu) thì cột kết quả không cuộn. Cuộn thêm bằng JS cho chắc.
     const vp = page.viewportSize() ?? { width: 1280, height: 900 };
@@ -239,8 +275,9 @@ async function scrapePage(context, url, scrolls) {
     const embedded = await readEmbedded();
     await Promise.allSettled([...pending]);
     const loginWall = /\/(accounts\/)?login/.test(page.url());
-    if (DEBUG) await dumpDebug(page, url, { status, loginWall, embedded, posts: found.size, net });
-    return { status, loginWall, posts: [...found.values()] };
+    // Trang không ra bài nào → tự lưu debug (kể cả khi chạy thật) để biết lý do
+    if (DEBUG || found.size === 0) await dumpDebug(page, url, { status, loginWall, embedded, posts: found.size, net, tab, emptyPage });
+    return { status, loginWall, emptyPage, tab, posts: [...found.values()] };
   } finally {
     await page.close().catch(() => {});
   }
@@ -250,6 +287,9 @@ async function scrapePage(context, url, scrolls) {
 async function dumpDebug(page, url, info) {
   const dir = path.resolve("scraper/debug");
   fs.mkdirSync(dir, { recursive: true });
+  // Chỉ giữ 30 file gần nhất (10 lần lưu)
+  const old = fs.readdirSync(dir).sort().reverse().slice(30);
+  for (const f of old) { try { fs.unlinkSync(path.join(dir, f)); } catch { /* bỏ qua */ } }
   const slug = new Date().toISOString().replace(/[:.]/g, "-");
   const html = await page.content().catch(() => "");
   fs.writeFileSync(path.join(dir, `${slug}.html`), html);
@@ -262,7 +302,7 @@ async function dumpDebug(page, url, info) {
     `HTTP:          ${info.status} · loginWall=${info.loginWall}`,
     `Đã đăng nhập:  ${cookies.includes("sessionid") ? "có (cookie sessionid)" : "KHÔNG thấy cookie sessionid"}`,
     `HTML:          ${html.length} ký tự · "taken_at" xuất hiện ${(html.match(/taken_at/g) ?? []).length} lần · script có dữ liệu bài: ${info.embedded}`,
-    `Bài tách được: ${info.posts}`,
+    `Bài tách được: ${info.posts}${info.tab ? ` · tab: ${info.tab}` : ""}${info.emptyPage ? " · Threads báo KHÔNG CÓ KẾT QUẢ" : ""}`,
     ``, `--- Response (xhr/fetch/document) ---`, ...info.net,
   ].join("\n");
   fs.writeFileSync(path.join(dir, `${slug}.txt`), report);
@@ -271,26 +311,41 @@ async function dumpDebug(page, url, info) {
   say(`Đã lưu ${slug}.html / .png / .txt trong scraper/debug/`);
 }
 
+// ---------- Bộ lọc theo quy tắc (trước khi tới AI) ----------
+/** Trả về lý do loại bài, hoặc null nếu giữ. */
+function dropReason(p, s, win) {
+  if (p.isReply) return "là reply";
+  if (p.text.length < 20) return "quá ngắn";
+  if (p.takenAt < win.since) return win.fromDate ? `trước ${viDate(win.fromDate)}` : `cũ hơn ${s.viralMaxAgeHours}h`;
+  if (win.until != null && p.takenAt > win.until) return "sau ngày kết thúc";
+  if (s.viralVietnameseOnly && !isVietnamese(p.text)) return "không phải tiếng Việt";
+  return null;
+}
+const fmtDrops = (m) => [...m].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${k}`).join(", ");
+
 // ---------- Một lượt quét ----------
 // Mỗi lượt gồm 2 loại việc, trộn ngẫu nhiên: đọc profile tài khoản nguồn + tìm theo từ khoá (tab TOP).
 async function runOnce(s) {
   const accounts = [...new Set(s.viralSourceAccounts.map((u) => String(u).trim().replace(/^@/, "")).filter(Boolean))];
   const keywords = s.scraperSearchKeywords ? [...new Set(s.viralKeywords.map((k) => String(k).trim()).filter(Boolean))] : [];
+  const win = viralWindow(s);
   const tasks = shuffle([
     ...accounts.map((u) => ({ kind: "account", label: `@${u}`, url: accountUrl(u) })),
-    ...keywords.map((k) => ({ kind: "search", label: k, url: searchUrl(k) })),
+    // Khoảng ngày: tìm kèm bộ lọc after:/before: của Threads; nếu Threads không ra kết quả thì tìm lại không kèm bộ lọc
+    ...keywords.map((k) => ({ kind: "search", label: k, url: searchUrl(rangedQuery(k, win)), plainUrl: win.fromDate ? searchUrl(k) : null })),
   ]);
   const started = Date.now();
   const result = {
     at: new Date().toISOString(), accounts: accounts.length, keywords: keywords.length, ok: 0, failed: 0,
-    keywordsOk: 0, searchNeedsLogin: false,
-    found: 0, kept: 0, newPosts: 0, blocked: false, ms: 0, errors: /** @type {string[]} */ ([]),
+    keywordsOk: 0, searchNeedsLogin: false, dropped: /** @type {Record<string, number>} */ ({}),
+    found: 0, kept: 0, newPosts: 0, duplicates: 0, window: "", blocked: false, ms: 0, errors: /** @type {string[]} */ ([]),
   };
   if (!tasks.length) {
     say("Chưa có tài khoản nguồn hay từ khoá nào. Thêm trong Cài đặt → Săn viral.");
     return result;
   }
-  const since = Date.now() / 1000 - s.viralMaxAgeHours * 3600;
+  result.window = win.label;
+  say(`Khoảng thời gian: ${win.label}`);
   const engagement = (p) => p.likes + p.replies * 3 + p.reposts * 5 + (p.quotes ?? 0) * 4;
   const { browser, context } = await openBrowser();
   // Tìm kiếm dùng cookie acc phụ (nếu có); đọc profile luôn ẩn danh để acc phụ ít bị để ý
@@ -303,12 +358,20 @@ async function runOnce(s) {
       // Threads bắt đăng nhập mới cho tìm kiếm → bỏ các từ khoá còn lại, vẫn đọc profile bình thường
       if (t.kind === "search" && result.searchNeedsLogin) continue;
       try {
-        const r = await scrapePage(t.kind === "search" ? searchContext : context, t.url, t.kind === "search" ? Math.max(4, s.scraperScrolls) : s.scraperScrolls);
+        const scrolls = t.kind === "search" ? Math.max(win.fromDate ? 6 : 4, s.scraperScrolls) : s.scraperScrolls;
+        let r = await scrapePage(t.kind === "search" ? searchContext : context, t.url, scrolls);
+        if (t.plainUrl && !r.loginWall && r.posts.length === 0) {
+          say(`Tìm "${t.label}" kèm bộ lọc ngày không ra bài — thử lại không kèm bộ lọc (vẫn lọc ngày sau khi lấy)`);
+          await sleep(jitter(4000, 8000));
+          r = await scrapePage(searchContext, t.plainUrl, scrolls);
+        }
         if (t.kind === "search" && r.loginWall) {
           result.searchNeedsLogin = true;
           const why = result.searchAuth ? "cookie acc phụ đã hết hạn/bị đăng xuất — chạy lại npm run scraper:login" : "Threads yêu cầu đăng nhập để tìm kiếm — chạy npm run scraper:login bằng acc phụ";
           result.errors.push(`Tìm "${t.label}": ${why}`);
           say(`Tìm "${t.label}": bị yêu cầu đăng nhập (${why}). Lượt này chỉ đọc tài khoản nguồn.`);
+        } else if (t.kind === "search" && r.emptyPage) {
+          result.errors.push(`Tìm "${t.label}": Threads trả "Không có kết quả" (cả tab Liên quan nhất và Mới đây)`);
         } else if (r.loginWall || r.status === 429 || r.status >= 500 || r.posts.length === 0) {
           badStreak++;
           result.failed++;
@@ -318,16 +381,23 @@ async function runOnce(s) {
           if (t.kind === "search") result.keywordsOk++; else result.ok++;
         }
         result.found += r.posts.length;
+        const drops = new Map();
         const keep = (r.loginWall ? [] : r.posts)
-          .filter((p) => !p.isReply && p.text.length >= 20 && p.takenAt >= since && p.likes >= s.scraperMinLikes
-            && p.likes >= s.viralMinLikes && p.replies >= s.viralMinReplies && (p.reposts + (p.quotes ?? 0)) >= s.viralMinReposts
-            && (!s.viralVietnameseOnly || isVietnamese(p.text)))
+          .filter((p) => {
+            const why = dropReason(p, s, win);
+            if (why) {
+              drops.set(why, (drops.get(why) ?? 0) + 1);
+              result.dropped[why] = (result.dropped[why] ?? 0) + 1;
+            }
+            return !why;
+          })
           .sort((a, b) => engagement(b) - engagement(a));
         for (const [rank, p] of keep.entries()) {
           if (await recordHit(p, t.label, rank)) result.newPosts++;
+          else result.duplicates++;
         }
         result.kept += keep.length;
-        say(`(${i + 1}/${tasks.length}) ${t.kind === "search" ? `Tìm "${t.label}"` : t.label}: ${r.posts.length} bài, giữ ${keep.length}`);
+        say(`(${i + 1}/${tasks.length}) ${t.kind === "search" ? `Tìm "${t.label}"${r.tab === "Mới đây" ? " [tab Mới đây]" : ""}` : t.label}: ${r.emptyPage ? "Threads báo không có kết quả · " : ""}${r.posts.length} bài, giữ ${keep.length}${drops.size ? ` (loại: ${fmtDrops(drops)})` : ""}`);
       } catch (e) {
         badStreak++;
         result.failed++;
@@ -356,10 +426,11 @@ async function runOnce(s) {
     result.blocked ? "error" : "watch",
     result.blocked
       ? `Scraper: có thể bị Threads giới hạn IP (${result.ok}/${result.accounts} tài khoản OK${kwPart}) — lượt sau sẽ thử lại`
-      : `Scraper: ${result.ok}/${result.accounts} tài khoản${kwPart}, giữ ${result.kept} bài, ${result.newPosts} bài mới`,
+      : `Scraper (${win.label}): ${result.ok}/${result.accounts} tài khoản${kwPart}, ${result.newPosts} bài mới, ${result.duplicates} bài trùng đã có`,
     result,
   );
-  say(`Xong: ${result.ok}/${result.accounts} tài khoản${kwPart}, giữ ${result.kept} bài (${result.newPosts} mới), ${Math.round(result.ms / 1000)}s`);
+  say(`Xong: ${result.ok}/${result.accounts} tài khoản${kwPart}, giữ ${result.kept} bài (${result.newPosts} mới, ${result.duplicates} trùng đã có), ${Math.round(result.ms / 1000)}s`);
+  if (Object.keys(result.dropped).length) say(`Bị loại theo quy tắc: ${fmtDrops(new Map(Object.entries(result.dropped)))}`);
   return result;
 }
 
@@ -372,12 +443,30 @@ async function runTest(target) {
     const search = args.includes("--search");
     const ctx = search && hasAuth() ? await newContext(browser, AUTH_FILE) : context;
     if (search) say(hasAuth() ? "Tìm kiếm bằng cookie acc phụ" : "Tìm kiếm ẩn danh (chưa có cookie — chạy npm run scraper:login nếu bị yêu cầu đăng nhập)");
-    const r = await scrapePage(ctx, search ? searchUrl(target) : accountUrl(target.replace(/^@/, "")), search ? 4 : 2);
-    say(`${search ? `Tìm "${target}"` : `@${target}`} · HTTP ${r.status}${r.loginWall ? " · bị yêu cầu đăng nhập" : ""} · tìm thấy ${r.posts.length} bài`);
+    let s = null;
+    try { s = await getSettings(); } catch { /* không đọc được Supabase → bỏ qua phần lọc */ }
+    const win = s ? viralWindow(s) : null;
+    if (win) say(`Khoảng thời gian theo Cài đặt: ${win.label}`);
+    const query = search && win?.fromDate ? rangedQuery(target, win) : target;
+    let r = await scrapePage(ctx, search ? searchUrl(query) : accountUrl(target.replace(/^@/, "")), search ? 4 : 2);
+    if (search && query !== target && !r.loginWall && r.posts.length === 0) {
+      say(`"${query}" không ra bài — thử lại không kèm bộ lọc ngày`);
+      r = await scrapePage(ctx, searchUrl(target), 4);
+    }
+    say(`${search ? `Tìm "${query}"${r.tab === "Mới đây" ? " [tab Mới đây]" : ""}` : `@${target}`} · HTTP ${r.status}${r.loginWall ? " · bị yêu cầu đăng nhập" : ""}${r.emptyPage ? " · Threads báo KHÔNG CÓ KẾT QUẢ" : ""} · tìm thấy ${r.posts.length} bài`);
     const ages = r.posts.map((p) => (Date.now() / 1000 - p.takenAt) / 86400);
     if (ages.length) say(`Độ mới: ${ages.filter((d) => d <= 3).length} bài ≤3 ngày · ${ages.filter((d) => d > 3 && d <= 30).length} bài 4–30 ngày · ${ages.filter((d) => d > 30).length} bài >30 ngày`);
+    if (s) {
+      const drops = new Map();
+      let kept = 0;
+      for (const p of r.posts) {
+        const why = dropReason(p, s, win);
+        if (why) drops.set(why, (drops.get(why) ?? 0) + 1); else kept++;
+      }
+      say(`Theo Cài đặt hiện tại: giữ ${kept}/${r.posts.length}${drops.size ? ` · loại: ${fmtDrops(drops)}` : ""}`);
+    }
     for (const p of r.posts.slice(0, 10)) {
-      console.log(`- @${p.username} ${new Date(p.takenAt * 1000).toLocaleString("vi-VN")} ♥${p.likes} 💬${p.replies} 🔁${p.reposts}${p.isReply ? " (reply)" : ""}${isVietnamese(p.text) ? "" : " (không phải tiếng Việt)"}`);
+      console.log(`- @${p.username} ${new Date(p.takenAt * 1000).toLocaleString("vi-VN")} ♥${p.likes} 💬${p.replies} 🔁${p.reposts}${p.isReply ? " (reply)" : ""}${s ? ` → ${dropReason(p, s, win) ? "LOẠI: " + dropReason(p, s, win) : "GIỮ"}` : ""}`);
       console.log(`  ${p.text.slice(0, 120).replace(/\n/g, " ")}`);
     }
   } finally {

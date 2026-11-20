@@ -184,13 +184,14 @@ export const hideReply = (replyId: string, hide = true) =>
 // ---------- Tìm kiếm (cần threads_keyword_search) ----------
 export const keywordSearch = (
   q: string,
-  opts: { searchType?: "TOP" | "RECENT"; since?: number; limit?: number; mediaType?: "TEXT" | "IMAGE" | "VIDEO" } = {},
+  opts: { searchType?: "TOP" | "RECENT"; since?: number; until?: number; limit?: number; mediaType?: "TEXT" | "IMAGE" | "VIDEO" } = {},
 ) =>
   call<{ data: ThreadsPost[] }>("GET", "keyword_search", {
     q,
     search_type: opts.searchType ?? "TOP",
     media_type: opts.mediaType,
     since: opts.since,
+    until: opts.until,
     limit: opts.limit ?? 25,
     fields: POST_FIELDS,
   });

@@ -16,6 +16,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { isValidCron } from "@/lib/cronMatch";
 
 type LinkMode = "reply" | "inline" | "none";
@@ -27,8 +28,8 @@ interface Settings {
   viralKeywords: string[]; viralCron: string; viralMaxAgeHours: number; viralSearchLimit: number;
   autoViralDrafts: boolean; viralDailyDrafts: number; minViralScore: number;
   viralSource: "apify" | "scraper" | "meta" | "manual"; apifyActor: string;
-  viralSourceAccounts: string[]; scraperSearchKeywords: boolean; scraperIntervalMinutes: number; scraperMinLikes: number; scraperScrolls: number; apifyMaxPosts: number; apifyPricePer1k: number;
-  apifyMonthlyBudget: number; apifyInputTemplate: string; viralMinLikes: number; viralMinReplies: number; viralMinReposts: number; viralVietnameseOnly: boolean;
+  viralSourceAccounts: string[]; scraperSearchKeywords: boolean; scraperIntervalMinutes: number; scraperScrolls: number; apifyMaxPosts: number; apifyPricePer1k: number;
+  apifyMonthlyBudget: number; apifyInputTemplate: string; viralDateMode: "recent" | "range"; viralDateFrom: string; viralDateTo: string; viralVietnameseOnly: boolean;
   affiliateEnabled: boolean; linkMode: LinkMode; affiliateDisclosure: string; shopeeSubId: string;
 }
 interface ScanInfo { source: string; apify: { hasToken: boolean; usage: { month: string; runs: number; items: number; estUsd: number }; budget: number } }
@@ -53,6 +54,52 @@ function runsPerDay(expr: string, _tz?: string) {
 }
 const usd = (v: number) => `$${v < 1 ? v.toFixed(2) : v.toFixed(1)}`;
 
+/** Lấy bài trong N giờ gần đây, hoặc theo khoảng ngày (từ … đến …). */
+function DateWindowField({ form, set }: { form: Settings; set: <K extends keyof Settings>(k: K, v: Settings[K]) => void }) {
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: form.timezone });
+  const preset = (days: number) => {
+    const from = new Date(Date.parse(`${today}T00:00:00Z`) - (days - 1) * 86_400_000).toISOString().slice(0, 10);
+    set("viralDateFrom", from);
+    set("viralDateTo", today);
+  };
+  return (
+    <Field label="Thời gian đăng bài" hint={form.viralDateMode === "range"
+      ? "Chỉ lấy bài đăng trong khoảng này (theo giờ Việt Nam). Để trống ngày kết thúc = tới hôm nay."
+      : "Chỉ lấy bài đăng trong số giờ gần đây (1–168)."}>
+      <div className="grid gap-2">
+        <ToggleGroup type="single" className="w-full" value={form.viralDateMode}
+          onValueChange={(v) => {
+            if (!v) return;
+            set("viralDateMode", v as Settings["viralDateMode"]);
+            if (v === "range" && !form.viralDateFrom) preset(7);
+          }}>
+          <ToggleGroupItem value="recent" className="flex-1">Gần đây</ToggleGroupItem>
+          <ToggleGroupItem value="range" className="flex-1">Khoảng ngày</ToggleGroupItem>
+        </ToggleGroup>
+        {form.viralDateMode === "range" ? <>
+          <div className="grid grid-cols-2 gap-2">
+            <label className="grid gap-1 text-xs"><span className="text-muted-foreground">Từ ngày</span>
+              <Input type="date" max={form.viralDateTo || today} value={form.viralDateFrom} onChange={(e) => set("viralDateFrom", e.target.value)} /></label>
+            <label className="grid gap-1 text-xs"><span className="text-muted-foreground">Đến ngày</span>
+              <Input type="date" min={form.viralDateFrom || undefined} max={today} value={form.viralDateTo} onChange={(e) => set("viralDateTo", e.target.value)} /></label>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {([[1, "Hôm nay"], [7, "7 ngày"], [30, "30 ngày"], [90, "90 ngày"]] as const).map(([d, l]) => (
+              <Button key={d} type="button" size="sm" variant="secondary" className="h-7 text-xs" onClick={() => preset(d)}>{l}</Button>
+            ))}
+          </div>
+        </> : (
+          <div className="flex items-center gap-2">
+            <Input type="number" inputMode="numeric" min={1} max={168} className="w-24" value={form.viralMaxAgeHours}
+              onChange={(e) => set("viralMaxAgeHours", Math.max(0, Number(e.target.value) || 0))} />
+            <span className="text-muted-foreground text-sm">giờ gần đây</span>
+          </div>
+        )}
+      </div>
+    </Field>
+  );
+}
+
 function ScraperSection({ form, set }: { form: Settings; set: <K extends keyof Settings>(k: K, v: Settings[K]) => void }) {
   const num = (v: string) => Math.max(0, Number(v) || 0);
   return (
@@ -69,9 +116,8 @@ function ScraperSection({ form, set }: { form: Settings; set: <K extends keyof S
       )}
       <div className="grid grid-cols-2 gap-3">
         <Field label="Quét mỗi (phút)" hint="30–1440"><Input type="number" inputMode="numeric" min={30} max={1440} value={form.scraperIntervalMinutes} onChange={(e) => set("scraperIntervalMinutes", num(e.target.value))} /></Field>
-        <Field label="Like tối thiểu" hint="Bỏ bài ít tương tác"><Input type="number" inputMode="numeric" min={0} value={form.scraperMinLikes} onChange={(e) => set("scraperMinLikes", num(e.target.value))} /></Field>
+        <Field label="Số lần cuộn trang" hint="0–5 · cuộn nhiều = lấy được bài cũ hơn"><Input type="number" inputMode="numeric" min={0} max={5} value={form.scraperScrolls} onChange={(e) => set("scraperScrolls", num(e.target.value))} /></Field>
       </div>
-      <Field label="Số lần cuộn trang" hint="0–5 · cuộn nhiều = lấy được nhiều bài cũ hơn nhưng chậm hơn"><Input type="number" inputMode="numeric" min={0} max={5} value={form.scraperScrolls} onChange={(e) => set("scraperScrolls", num(e.target.value))} /></Field>
       <p className="text-muted-foreground text-xs">Mỗi trang (profile hoặc tìm kiếm) cách nhau 6–14 giây. Nếu 3 trang liên tiếp lỗi, scraper tự dừng lượt đó và nghỉ gấp đôi. Bot không đăng nhập Threads khi quét nên tài khoản của bạn không bị ảnh hưởng.</p>
     </Section>
   );
@@ -116,7 +162,7 @@ function ApifySection({ form, set, info }: {
           <span>{used.items} bài · {used.runs} lần · ≈ {usd(used.estUsd)}</span></div>}
         {overBudget && <p className="text-destructive text-xs">Lịch hiện tại vượt ngân sách — bot sẽ dừng giữa tháng. Giảm số lần quét, số từ khoá hoặc số bài.</p>}
       </div>
-      <Field label="Mẫu input JSON (nâng cao, tuỳ chọn)" hint="Chỉ cần khi đổi actor. Biến: {{keywords}} (mảng), {{maxPosts}}, {{postedAfter}} (ISO).">
+      <Field label="Mẫu input JSON (nâng cao, tuỳ chọn)" hint="Chỉ cần khi đổi actor. Biến: {{keywords}} (mảng), {{maxPosts}}, {{postedAfter}}, {{postedBefore}} (ISO, trống nếu không giới hạn).">
         <Textarea value={form.apifyInputTemplate} onChange={(e) => set("apifyInputTemplate", e.target.value)} className="min-h-20 font-mono text-xs"
           placeholder={'{"mode":"search","searchQueries":{{keywords}},"maxPosts":{{maxPosts}},"postedAfter":"{{postedAfter}}"}'} />
       </Field>
@@ -414,19 +460,7 @@ export default function SettingsPage() {
               <SwitchRow id="vnOnly" title="Chỉ bài tiếng Việt" desc="Bỏ bài tiếng Anh, Thái, Trung… (tự nhận diện theo dấu tiếng Việt)"
                 checked={form.viralVietnameseOnly} onChange={(v) => set("viralVietnameseOnly", v)} />
             )}
-            {(form.viralSource === "apify" || form.viralSource === "scraper") && (
-              <Field label="Ngưỡng viral (phải đạt cả 3)" hint="Bài thiếu một trong ba sẽ bị bỏ. Gợi ý: 200 like · 20 bình luận · 5 chia sẻ.">
-                <div className="grid grid-cols-3 gap-2">
-                  {([["viralMinLikes", "♥ Like"], ["viralMinReplies", "💬 Bình luận"], ["viralMinReposts", "🔁 Chia sẻ"]] as const).map(([k, l]) => (
-                    <label key={k} className="grid gap-1 text-xs">
-                      <span className="text-muted-foreground">{l}</span>
-                      <Input type="number" inputMode="numeric" min={0} value={form[k]} onChange={(e) => set(k, num(e.target.value))} />
-                    </label>
-                  ))}
-                </div>
-              </Field>
-            )}
-            {form.viralSource === "scraper" && <Field label="Chỉ lấy bài trong (giờ)" hint="1–168 giờ"><Input type="number" inputMode="numeric" min={1} max={168} value={form.viralMaxAgeHours} onChange={(e) => set("viralMaxAgeHours", num(e.target.value))} /></Field>}
+            {form.viralSource !== "manual" && <DateWindowField form={form} set={set} />}
             {form.viralSource !== "manual" && form.viralSource !== "scraper" && <>
               <Field label="Từ khoá" hint={form.viralSource === "apify"
                 ? `Enter hoặc dấu phẩy để thêm · ${form.viralKeywords.length} từ khoá`
@@ -435,11 +469,8 @@ export default function SettingsPage() {
               </Field>
               <div className="grid grid-cols-2 gap-3">
                 <Field label="Lịch quét (cron)" hint="15 */6 * * * = mỗi 6 giờ"><Input value={form.viralCron} onChange={(e) => set("viralCron", e.target.value)} className="font-mono" /></Field>
-                {form.viralSource === "meta"
-                  ? <Field label="Số bài mỗi từ khoá" hint="5–100"><Input type="number" inputMode="numeric" min={5} max={100} value={form.viralSearchLimit} onChange={(e) => set("viralSearchLimit", num(e.target.value))} /></Field>
-                  : <Field label="Chỉ lấy bài trong (giờ)" hint="1–168 giờ"><Input type="number" inputMode="numeric" min={1} max={168} value={form.viralMaxAgeHours} onChange={(e) => set("viralMaxAgeHours", num(e.target.value))} /></Field>}
+                {form.viralSource === "meta" && <Field label="Số bài mỗi từ khoá" hint="5–100"><Input type="number" inputMode="numeric" min={5} max={100} value={form.viralSearchLimit} onChange={(e) => set("viralSearchLimit", num(e.target.value))} /></Field>}
               </div>
-              {form.viralSource === "meta" && <Field label="Chỉ lấy bài đăng trong (giờ)" hint="1–168 giờ"><Input type="number" inputMode="numeric" min={1} max={168} value={form.viralMaxAgeHours} onChange={(e) => set("viralMaxAgeHours", num(e.target.value))} /></Field>}
             </>}
           </Section>
           {form.viralSource === "apify" && <ApifySection form={form} set={set} info={scanInfo} />}

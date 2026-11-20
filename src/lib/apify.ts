@@ -3,6 +3,7 @@
 import { config } from "./config";
 import { kvGet, kvSet } from "./db";
 import type { Settings } from "./settings";
+import { viralWindow } from "./viralWindow";
 
 const APIFY = (process.env.APIFY_BASE_URL || "https://api.apify.com") + "/v2";
 export const DEFAULT_APIFY_ACTOR = "webdata_labs/threads-scraper";
@@ -54,13 +55,14 @@ async function addUsage(s: Settings, items: number) {
 export const estimateRunUsd = (s: Settings) => (s.viralKeywords.length * s.apifyMaxPosts * s.apifyPricePer1k) / 1000;
 
 /** Input cho actor. Mặc định theo schema của webdata_labs/threads-scraper; actor khác dùng mẫu JSON trong Cài đặt. */
-function buildInput(s: Settings, keywords: string[], postedAfter: string): unknown {
+function buildInput(s: Settings, keywords: string[], postedAfter: string, postedBefore: string): unknown {
   const tpl = s.apifyInputTemplate.trim();
   if (!tpl) return { mode: "search", searchQueries: keywords, maxPosts: s.apifyMaxPosts, postedAfter };
   const filled = tpl
     .replace(/"\{\{keywords\}\}"|\{\{keywords\}\}/g, JSON.stringify(keywords))
     .replace(/"\{\{maxPosts\}\}"|\{\{maxPosts\}\}/g, String(s.apifyMaxPosts))
-    .replace(/\{\{postedAfter\}\}/g, postedAfter);
+    .replace(/\{\{postedAfter\}\}/g, postedAfter)
+    .replace(/\{\{postedBefore\}\}/g, postedBefore);
   try {
     return JSON.parse(filled);
   } catch {
@@ -121,7 +123,9 @@ export async function apifySearch(s: Settings): Promise<{ posts: ScrapedPost[]; 
   const token = config.apifyToken;
   if (!token) throw new Error("Chưa có APIFY_TOKEN trong .env.local (apify.com → Settings → API & Integrations)");
   const actor = (s.apifyActor.trim() || DEFAULT_APIFY_ACTOR).replace("/", "~");
-  const postedAfter = new Date(Date.now() - s.viralMaxAgeHours * 3600_000).toISOString();
+  const win = viralWindow(s);
+  const postedAfter = new Date(win.since * 1000).toISOString();
+  const postedBefore = win.until ? new Date(win.until * 1000).toISOString() : "";
   const posts: ScrapedPost[] = [];
   let items = 0;
   let usage = await apifyUsage(s);
@@ -137,7 +141,7 @@ export async function apifySearch(s: Settings): Promise<{ posts: ScrapedPost[]; 
     const res = await fetch(`${APIFY}/acts/${encodeURIComponent(actor)}/run-sync-get-dataset-items?${qs}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify(buildInput(s, keywords, postedAfter)),
+      body: JSON.stringify(buildInput(s, keywords, postedAfter, postedBefore)),
       signal: AbortSignal.timeout(270_000),
     });
     if (!res.ok) {

@@ -25,8 +25,9 @@ interface Usage { month: string; runs: number; items: number; estUsd: number }
 interface ScanResult {
   source?: string; keywords: number; total: number; own: number; scanned: number; newPosts: number; classified: number;
   errors: number; limited: boolean; skipped?: string; usage?: Usage; at: string;
+  duplicates?: number; outOfRange?: number; foreign?: number; window?: string;
 }
-interface ScraperRun { at: string; accounts: number; keywords?: number; keywordsOk?: number; searchNeedsLogin?: boolean; ok: number; failed: number; found: number; kept: number; newPosts: number; blocked: boolean; errors: string[] }
+interface ScraperRun { at: string; accounts: number; keywords?: number; keywordsOk?: number; searchNeedsLogin?: boolean; ok: number; failed: number; found: number; kept: number; newPosts: number; duplicates?: number; window?: string; blocked: boolean; errors: string[] }
 interface ScanInfo { last: ScanResult | null; source: "apify" | "scraper" | "meta" | "manual"; scraper: { last: ScraperRun | null; accounts: number; intervalMinutes: number }; apify: { hasToken: boolean; usage: Usage; estRunUsd: number; budget: number } }
 
 const compact = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}K` : String(n));
@@ -35,7 +36,8 @@ function scanSummary(r: ScanResult) {
   if (r.skipped) return r.skipped;
   if (r.source === "scraper") return `AI đã phân loại ${r.classified} bài do scraper lấy về và chấm điểm lại.`;
   if (r.limited) return `Threads trả về ${r.total} bài, ${r.own} là bài của bạn, 0 bài công khai.`;
-  return `Quét ${r.keywords} từ khoá: ${r.scanned} bài công khai, ${r.newPosts} bài mới, AI phân loại ${r.classified}.${r.errors ? ` ${r.errors} lỗi (xem Nhật ký).` : ""}${r.usage ? ` Tháng này ≈ $${r.usage.estUsd}.` : ""}`;
+  const skipped = [r.duplicates && `${r.duplicates} bài trùng đã có`, r.outOfRange && `${r.outOfRange} ngoài khoảng ngày`, r.foreign && `${r.foreign} không phải tiếng Việt`].filter(Boolean);
+  return `Quét ${r.keywords} từ khoá${r.window ? ` (${r.window})` : ""}: ${r.newPosts} bài mới${skipped.length ? `, bỏ qua ${skipped.join(", ")}` : ""}, AI phân loại ${r.classified}.${r.errors ? ` ${r.errors} lỗi (xem Nhật ký).` : ""}${r.usage ? ` Tháng này ≈ $${r.usage.estUsd}.` : ""}`;
 }
 type F = "new" | "used" | "dismissed";
 
@@ -122,7 +124,7 @@ export default function ViralPage() {
                 ) : (
                   <p className="text-muted-foreground">
                     Lượt gần nhất {fmtTime(r.at)}: {r.ok}/{r.accounts} tài khoản OK
-                    {!!r.keywords && `, ${r.keywordsOk ?? 0}/${r.keywords} từ khoá`}, giữ {r.kept} bài ({r.newPosts} mới).
+                    {!!r.keywords && `, ${r.keywordsOk ?? 0}/${r.keywords} từ khoá`}, giữ {r.kept} bài ({r.newPosts} mới{r.duplicates ? `, ${r.duplicates} trùng đã có` : ""}){r.window ? ` · ${r.window}` : ""}.
                     {r.searchNeedsLogin && " Tìm kiếm bị yêu cầu đăng nhập — chạy npm run scraper:login bằng acc phụ (hoặc chạy lại nếu cookie hết hạn). Lượt này chỉ đọc tài khoản nguồn."}
                     {r.blocked && " Có vẻ Threads đang giới hạn IP — scraper sẽ tự nghỉ lâu hơn rồi thử lại."}
                     {stale && !r.blocked && " Đã lâu không có lượt mới — kiểm tra scraper trên máy còn chạy không."}
@@ -252,11 +254,16 @@ export default function ViralPage() {
         description="Thấy bài mẹo hay đang nổi trên Threads? Dán link và/hoặc nội dung — AI sẽ phân loại, chấm điểm, rồi bạn bấm Viết bài tương tự."
         footer={
           <Button disabled={busy === "manual" || (!manual.url.trim() && !manual.text.trim())} onClick={() => run("manual", async () => {
-            await api("/viral/manual", { method: "POST", body: manual });
+            const r = await api<{ duplicate?: boolean; status: string }>("/viral/manual", { method: "POST", body: manual });
             setManualOpen(false);
-            if (filter !== "new") setFilter("new");
+            if (r.duplicate) {
+              notify(`Bài này đã có trong kho${r.status === "used" ? " (đã viết lại)" : r.status === "dismissed" ? " (đã bỏ qua)" : ""} — không thêm trùng`, true);
+            } else {
+              notify("Đã thêm bài — AI đã phân loại");
+              if (filter !== "new") setFilter("new");
+            }
             await reload();
-          }, "Đã thêm bài — AI đã phân loại")}>
+          })}>
             {busy === "manual" ? <><Spinner /> Đang phân tích…</> : <><Plus /> Thêm</>}
           </Button>
         }>
