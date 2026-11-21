@@ -403,8 +403,9 @@ export default function SettingsPage() {
   const dirty = useMemo(() => !!data && !!form && JSON.stringify(form) !== JSON.stringify(data), [data, form]);
 
   if (loading || !form || !meta) return <ListSkeleton rows={4} />;
-  const set = <K extends keyof Settings>(k: K, v: Settings[K]) => setForm({ ...form, [k]: v });
-  const setMany = (p: Partial<Settings>) => setForm({ ...form, ...p });
+  // Cập nhật theo giá trị mới nhất (gọi set() nhiều lần liên tiếp không ghi đè lẫn nhau)
+  const set = <K extends keyof Settings>(k: K, v: Settings[K]) => setForm((f) => (f ? { ...f, [k]: v } : f));
+  const setMany = (p: Partial<Settings>) => setForm((f) => (f ? { ...f, ...p } : f));
   const num = (v: string) => Math.max(0, Number(v) || 0);
   const save = (body: Settings) => run("save", async () => {
     setData(await api<Settings>("/settings", { method: "PUT", body }));
