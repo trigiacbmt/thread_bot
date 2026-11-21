@@ -17,6 +17,7 @@ import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { DateRangePicker } from "@/components/ui/date-range-picker";
 import { isValidCron } from "@/lib/cronMatch";
 
 type LinkMode = "reply" | "inline" | "none";
@@ -64,7 +65,7 @@ function DateWindowField({ form, set }: { form: Settings; set: <K extends keyof 
   };
   return (
     <Field label="Thời gian đăng bài" hint={form.viralDateMode === "range"
-      ? "Chỉ lấy bài đăng trong khoảng này (theo giờ Việt Nam). Để trống ngày kết thúc = tới hôm nay."
+      ? "Bấm để chọn ngày bắt đầu rồi ngày kết thúc trên lịch (giờ Việt Nam). Chọn đến hôm nay = luôn lấy tới hiện tại."
       : "Chỉ lấy bài đăng trong số giờ gần đây (1–168)."}>
       <div className="grid gap-2">
         <ToggleGroup type="single" className="w-full" value={form.viralDateMode}
@@ -76,19 +77,11 @@ function DateWindowField({ form, set }: { form: Settings; set: <K extends keyof 
           <ToggleGroupItem value="recent" className="flex-1">Gần đây</ToggleGroupItem>
           <ToggleGroupItem value="range" className="flex-1">Khoảng ngày</ToggleGroupItem>
         </ToggleGroup>
-        {form.viralDateMode === "range" ? <>
-          <div className="grid grid-cols-2 gap-2">
-            <label className="grid gap-1 text-xs"><span className="text-muted-foreground">Từ ngày</span>
-              <Input type="date" max={form.viralDateTo || today} value={form.viralDateFrom} onChange={(e) => set("viralDateFrom", e.target.value)} /></label>
-            <label className="grid gap-1 text-xs"><span className="text-muted-foreground">Đến ngày</span>
-              <Input type="date" min={form.viralDateFrom || undefined} max={today} value={form.viralDateTo} onChange={(e) => set("viralDateTo", e.target.value)} /></label>
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            {([[1, "Hôm nay"], [7, "7 ngày"], [30, "30 ngày"], [90, "90 ngày"]] as const).map(([d, l]) => (
-              <Button key={d} type="button" size="sm" variant="secondary" className="h-7 text-xs" onClick={() => preset(d)}>{l}</Button>
-            ))}
-          </div>
-        </> : (
+        {form.viralDateMode === "range" ? (
+          <DateRangePicker from={form.viralDateFrom} to={form.viralDateTo} max={today}
+            onChange={(f, t) => { set("viralDateFrom", f); set("viralDateTo", t); }}
+            presets={[[1, "Hôm nay"], [7, "7 ngày"], [30, "30 ngày"], [90, "90 ngày"]]} />
+        ) : (
           <div className="flex items-center gap-2">
             <Input type="number" inputMode="numeric" min={1} max={168} className="w-24" value={form.viralMaxAgeHours}
               onChange={(e) => set("viralMaxAgeHours", Math.max(0, Number(e.target.value) || 0))} />
